@@ -364,6 +364,23 @@ public static class VideoOutExports
     }
 
     [SysAbiExport(
+        Nid = "zgXifHT9ErY",
+        ExportName = "sceVideoOutIsFlipPending",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceVideoOut")]
+    public static int VideoOutIsFlipPending(CpuContext ctx)
+    {
+        var handle = unchecked((int)ctx[CpuRegister.Rdi]);
+        if (!TryGetPort(handle, out _))
+        {
+            return OrbisVideoOutErrorInvalidHandle;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "U2JJtSqNKZI",
         ExportName = "sceVideoOutGetEventId",
         Target = Generation.Gen4 | Generation.Gen5,
