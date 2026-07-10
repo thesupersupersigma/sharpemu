@@ -22,6 +22,7 @@ public static class KernelPthreadExtendedCompatExports
     private const int DefaultSchedPriority = DefaultThreadPriority;
     private const ulong SyntheticRwlockHandleBase = 0x00006003_0000_0000;
     private const ulong SyntheticPthreadAttrHandleBase = 0x00006004_0000_0000;
+    private const ulong SyntheticRwlockAttrHandleBase = 0x00006005_0000_0000;
 
     private static readonly object _stateGate = new();
     private static readonly Dictionary<ulong, ThreadState> _threadStates = new();
@@ -31,6 +32,7 @@ public static class KernelPthreadExtendedCompatExports
     private static int _nextTlsKey = 1;
     private static long _nextSyntheticRwlockHandleId = 1;
     private static long _nextSyntheticPthreadAttrHandleId = 1;
+    private static long _nextSyntheticRwlockAttrHandleId = 1;
 
     private static readonly ConcurrentDictionary<ulong, ConcurrentDictionary<int, ulong>> _threadLocalSpecific = new();
 
@@ -840,6 +842,37 @@ public static class KernelPthreadExtendedCompatExports
     }
 
     [SysAbiExport(
+        Nid = "Bvn74vj6oLo",
+        ExportName = "scePthreadAttrSetstack",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadAttrSetstack(CpuContext ctx)
+    {
+        var attrAddress = ctx[CpuRegister.Rdi];
+        var stackAddress = ctx[CpuRegister.Rsi];
+        var stackSize = ctx[CpuRegister.Rdx];
+        if (attrAddress == 0 || stackAddress == 0 || stackSize == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var resolvedAddress = ResolvePthreadAttrHandle(ctx, attrAddress);
+        lock (_stateGate)
+        {
+            var state = GetOrCreateAttrStateLocked(resolvedAddress);
+            var updated = state with { StackAddress = stackAddress, StackSize = stackSize };
+            _attrStates[resolvedAddress] = updated;
+            if (resolvedAddress != attrAddress)
+            {
+                _attrStates[attrAddress] = updated;
+            }
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "6ULAa0fq4jA",
         ExportName = "scePthreadRwlockInit",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -1017,6 +1050,47 @@ public static class KernelPthreadExtendedCompatExports
     public static int PosixPthreadRwlockUnlock(CpuContext ctx) => PthreadRwlockUnlock(ctx);
 
     [SysAbiExport(
+        Nid = "yOfGg-I1ZII",
+        ExportName = "scePthreadRwlockattrInit",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadRwlockattrInit(CpuContext ctx)
+    {
+        var attrAddress = ctx[CpuRegister.Rdi];
+        if (attrAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        var syntheticHandle = AllocateSyntheticHandle(SyntheticRwlockAttrHandleBase, ref _nextSyntheticRwlockAttrHandleId);
+        if (!KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, attrAddress, syntheticHandle))
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "i2ifZ3fS2fo",
+        ExportName = "scePthreadRwlockattrDestroy",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libKernel")]
+    public static int PthreadRwlockattrDestroy(CpuContext ctx)
+    {
+        var attrAddress = ctx[CpuRegister.Rdi];
+        if (attrAddress == 0)
+        {
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
+        }
+
+        _ = KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, attrAddress, 0);
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
         Nid = "mqULNdimTn0",
         ExportName = "pthread_key_create",
         Target = Generation.Gen4 | Generation.Gen5,
@@ -1045,7 +1119,7 @@ public static class KernelPthreadExtendedCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        ctx[CpuRegister.Rax] = unchecked((uint)key);
+        ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 

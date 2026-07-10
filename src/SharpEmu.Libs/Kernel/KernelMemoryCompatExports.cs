@@ -2531,6 +2531,17 @@ public static class KernelMemoryCompatExports
             if (fixedMapping && requestedAddress != 0)
             {
                 mappedAddress = requestedAddress;
+                reserved = IsGuestRangeBacked(ctx, requestedAddress, length);
+                if (!reserved)
+                {
+                    TryReserveExactGuestVirtualRange(ctx, requestedAddress, length, protection);
+                    reserved = IsGuestRangeBacked(ctx, requestedAddress, length);
+                }
+
+                if (!reserved)
+                {
+                    mappedAddress = 0;
+                }
             }
             else
             {
@@ -2541,7 +2552,7 @@ public static class KernelMemoryCompatExports
                 Console.Error.WriteLine(
                     $"[LOADER][TRACE] map_direct reserve: requested=0x{requestedAddress:X16} desired=0x{desiredAddress:X16} reserved={reserved} mapped=0x{mappedAddress:X16}");
             }
-            if (!reserved)
+            if (!reserved && !fixedMapping)
             {
                 if (mappedAddress == 0)
                 {
@@ -2625,12 +2636,18 @@ public static class KernelMemoryCompatExports
             if (fixedMapping && requestedAddress != 0)
             {
                 mappedAddress = requestedAddress;
+                if (!IsGuestRangeBacked(ctx, requestedAddress, length))
+                {
+                    TryReserveExactGuestVirtualRange(ctx, requestedAddress, length, protection);
+                    if (!IsGuestRangeBacked(ctx, requestedAddress, length))
+                    {
+                        mappedAddress = 0;
+                    }
+                }
             }
             else if (!TryReserveGuestVirtualRange(ctx, desiredAddress, length, protection, OrbisPageSize, out mappedAddress))
             {
-                mappedAddress = requestedAddress != 0 && fixedMapping
-                    ? requestedAddress
-                    : AllocateMappedGuestAddress(ctx, length, 0x1000UL);
+                mappedAddress = AllocateMappedGuestAddress(ctx, length, 0x1000UL);
             }
 
             if (ShouldTraceDirectMemory())
@@ -3993,6 +4010,37 @@ public static class KernelMemoryCompatExports
             allowAllocateAtAlternative: false,
             "reserve range",
             out mappedAddress);
+    }
+
+    private static bool TryReserveExactGuestVirtualRange(
+        CpuContext ctx,
+        ulong desiredAddress,
+        ulong length,
+        int protection)
+    {
+        var executable = (protection & OrbisProtCpuExec) != 0;
+        return KernelVirtualRangeAllocator.TryReserve(
+            ctx,
+            desiredAddress,
+            length,
+            executable,
+            alignment: 0,
+            allowSearch: false,
+            allowAllocateAtAlternative: false,
+            "reserve fixed range",
+            out _);
+    }
+
+    private static bool IsGuestRangeBacked(CpuContext ctx, ulong address, ulong length)
+    {
+        if (address == 0 || length == 0 || ulong.MaxValue - address < length - 1)
+        {
+            return false;
+        }
+
+        Span<byte> probe = stackalloc byte[1];
+        return ctx.Memory.TryRead(address, probe) &&
+               ctx.Memory.TryRead(address + length - 1, probe);
     }
 
     private static bool IsMappedGuestRangeAvailable(
