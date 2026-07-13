@@ -8,12 +8,15 @@ using SharpEmu.HLE;
 using SharpEmu.Logging;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 
 namespace SharpEmu.CLI;
 
 internal static partial class Program
 {
     private static readonly SharpEmuLogger Log = SharpEmuLog.For("SharpEmu.CLI");
+    private static readonly object ConsoleMirrorSync = new();
+    private static StreamWriter? _consoleMirrorFile;
     private const int DefaultImportTraceLimit = 32;
     private const string MitigatedChildFlag = "--sharpemu-mitigated-child";
     private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
@@ -47,6 +50,7 @@ internal static partial class Program
         }
         finally
         {
+            DropConsoleFileMirror();
             SharpEmuLog.Shutdown();
         }
     }
@@ -65,6 +69,10 @@ internal static partial class Program
         // itself to a console before the first write.
         EnsureCliConsole();
         UseUtf8ConsoleOutput();
+        if (isMitigatedChild && TryGetLogFileArgument(args, out var earlyLogFilePath))
+        {
+            TryEnableConsoleFileMirror(earlyLogFilePath);
+        }
 
         Console.Error.WriteLine($"[DEBUG] SharpEmu starting with {args.Length} args");
 
@@ -73,10 +81,15 @@ internal static partial class Program
             return childExitCode;
         }
 
-        if (!TryParseArguments(args, out var ebootPath, out var runtimeOptions, out var logLevel))
+        if (!TryParseArguments(args, out var ebootPath, out var runtimeOptions, out var logLevel, out var logFilePath))
         {
             PrintUsage();
             return 1;
+        }
+
+        if (!isMitigatedChild && !string.IsNullOrWhiteSpace(logFilePath))
+        {
+            TryEnableConsoleFileMirror(logFilePath);
         }
 
         SharpEmuLog.MinimumLevel = logLevel;
@@ -421,6 +434,202 @@ internal static partial class Program
         }
     }
 
+    private static bool TryGetLogFileArgument(IReadOnlyList<string> args, out string path)
+    {
+        for (var i = 0; i < args.Count; i++)
+        {
+            var argument = args[i];
+            if (string.Equals(argument, "--log-file", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Count &&
+                    !string.IsNullOrWhiteSpace(args[i + 1]) &&
+                    !args[i + 1].StartsWith("--", StringComparison.Ordinal) &&
+                    ShouldConsumeLogFilePath(args, i + 1))
+                {
+                    path = args[i + 1];
+                    return true;
+                }
+
+                path = BuildDefaultLogFilePath(TryFindEbootPathToken(args));
+                return true;
+            }
+
+            const string logFilePrefix = "--log-file=";
+            if (argument.StartsWith(logFilePrefix, StringComparison.OrdinalIgnoreCase) &&
+                !string.IsNullOrWhiteSpace(argument[logFilePrefix.Length..]))
+            {
+                path = argument[logFilePrefix.Length..];
+                return true;
+            }
+        }
+
+        path = string.Empty;
+        return false;
+    }
+
+    private static string BuildDefaultLogFilePath(string? ebootPath)
+    {
+        var baseDirectory = AppContext.BaseDirectory;
+        var logsDirectory = Path.Combine(baseDirectory, "user", "logs");
+        var name = TryReadTitleId(ebootPath) ?? "UNKNOWN";
+
+        foreach (var invalid in Path.GetInvalidFileNameChars())
+        {
+            name = name.Replace(invalid, '_');
+        }
+
+        return Path.Combine(logsDirectory, $"{name}-{DateTime.Now:yyyyMMdd-HHmmss}.log");
+    }
+
+    private static string? TryReadTitleId(string? ebootPath)
+    {
+        if (string.IsNullOrWhiteSpace(ebootPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            var directory = Path.GetDirectoryName(Path.GetFullPath(ebootPath));
+            if (string.IsNullOrEmpty(directory))
+            {
+                return null;
+            }
+
+            foreach (var paramPath in new[]
+            {
+                Path.Combine(directory, "sce_sys", "param.json"),
+                Path.Combine(directory, "param.json"),
+            })
+            {
+                if (!File.Exists(paramPath))
+                {
+                    continue;
+                }
+
+                using var stream = File.OpenRead(paramPath);
+                using var document = JsonDocument.Parse(stream);
+                if (document.RootElement.TryGetProperty("titleId", out var titleIdElement) &&
+                    titleIdElement.ValueKind == JsonValueKind.String)
+                {
+                    var titleId = titleIdElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(titleId))
+                    {
+                        return titleId.Trim();
+                    }
+                }
+            }
+        }
+        catch
+        {
+            // Logging should never block launch; unknown title ids use a stable fallback.
+        }
+
+        return null;
+    }
+
+    private static string? TryFindEbootPathToken(IReadOnlyList<string> args)
+    {
+        for (var i = args.Count - 1; i >= 0; i--)
+        {
+            var argument = args[i];
+            if (string.IsNullOrWhiteSpace(argument) ||
+                argument.StartsWith("--", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            return argument;
+        }
+
+        return null;
+    }
+
+    private static bool ShouldConsumeLogFilePath(IReadOnlyList<string> args, int candidateIndex)
+    {
+        var candidate = args[candidateIndex];
+        if (LooksLikeLogFilePath(candidate))
+        {
+            return true;
+        }
+
+        for (var i = candidateIndex + 1; i < args.Count; i++)
+        {
+            var argument = args[i];
+            if (!string.IsNullOrWhiteSpace(argument) &&
+                !argument.StartsWith("--", StringComparison.Ordinal))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool LooksLikeLogFilePath(string path)
+    {
+        var extension = Path.GetExtension(path);
+        return string.Equals(extension, ".log", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(extension, ".txt", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void TryEnableConsoleFileMirror(string path)
+    {
+        lock (ConsoleMirrorSync)
+        {
+            if (_consoleMirrorFile is not null)
+            {
+                return;
+            }
+
+            try
+            {
+                var directory = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
+                var stream = new FileStream(
+                    path,
+                    FileMode.Create,
+                    FileAccess.Write,
+                    FileShare.ReadWrite,
+                    bufferSize: 4096,
+                    FileOptions.SequentialScan);
+                _consoleMirrorFile = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false))
+                {
+                    AutoFlush = true,
+                };
+
+                Console.SetOut(new TeeTextWriter(Console.Out, _consoleMirrorFile));
+                Console.SetError(new TeeTextWriter(Console.Error, _consoleMirrorFile));
+                Console.Error.WriteLine($"[DEBUG] Log file: {Path.GetFullPath(path)}");
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[WARN] Could not open log file '{path}': {ex.Message}");
+            }
+        }
+    }
+
+    private static void DropConsoleFileMirror()
+    {
+        lock (ConsoleMirrorSync)
+        {
+            try
+            {
+                _consoleMirrorFile?.Flush();
+                _consoleMirrorFile?.Dispose();
+            }
+            catch
+            {
+            }
+
+            _consoleMirrorFile = null;
+        }
+    }
+
     private static void ConfigureInheritedStdHandles(ref STARTUPINFO startupInfo)
     {
         if (!OperatingSystem.IsWindows())
@@ -559,27 +768,30 @@ internal static partial class Program
 
     private static void PrintUsage()
     {
-        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] <path-to-eboot.bin>");
-        Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug ""E:\Games\...\eboot.bin""");
+        Log.Info("Usage: SharpEmu.CLI [--strict] [--trace-imports[=N]] [--cpu-engine=<native>] [--log-level=<level>] [--log-file[=<path>]] <path-to-eboot.bin>");
+        Log.Info(@"Example: SharpEmu.CLI --cpu-engine=native --trace-imports=64 --log-level=debug --log-file ""E:\Games\...\eboot.bin""");
     }
 
     private static bool TryParseArguments(
         string[] args,
         out string ebootPath,
         out SharpEmuRuntimeOptions runtimeOptions,
-        out LogLevel logLevel)
+        out LogLevel logLevel,
+        out string? logFilePath)
     {
         if (args.Length == 0)
         {
             ebootPath = string.Empty;
             runtimeOptions = default;
             logLevel = SharpEmuLog.MinimumLevel;
+            logFilePath = null;
             return false;
         }
 
         var strictDynlibResolution = false;
         var importTraceLimit = 0;
         var cpuEngine = CpuExecutionEngine.NativeOnly;
+        logFilePath = null;
         logLevel = SharpEmuLog.MinimumLevel;
         var pathTokens = new List<string>(args.Length);
         for (var i = 0; i < args.Length; i++)
@@ -609,6 +821,7 @@ internal static partial class Program
                 {
                     ebootPath = string.Empty;
                     runtimeOptions = default;
+                    logFilePath = null;
                     return false;
                 }
 
@@ -622,10 +835,28 @@ internal static partial class Program
                 {
                     ebootPath = string.Empty;
                     runtimeOptions = default;
+                    logFilePath = null;
                     return false;
                 }
 
                 i++;
+                continue;
+            }
+
+            if (string.Equals(argument, "--log-file", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length &&
+                    !string.IsNullOrWhiteSpace(args[i + 1]) &&
+                    !args[i + 1].StartsWith("--", StringComparison.Ordinal) &&
+                    ShouldConsumeLogFilePath(args, i + 1))
+                {
+                    logFilePath = args[++i];
+                }
+                else
+                {
+                    logFilePath = BuildDefaultLogFilePath(TryFindEbootPathToken(args));
+                }
+
                 continue;
             }
 
@@ -652,6 +883,7 @@ internal static partial class Program
                     ebootPath = string.Empty;
                     runtimeOptions = default;
                     logLevel = SharpEmuLog.MinimumLevel;
+                    logFilePath = null;
                     return false;
                 }
 
@@ -674,11 +906,27 @@ internal static partial class Program
                 continue;
             }
 
+            const string logFilePrefix = "--log-file=";
+            if (argument.StartsWith(logFilePrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                logFilePath = argument[logFilePrefix.Length..];
+                if (string.IsNullOrWhiteSpace(logFilePath))
+                {
+                    ebootPath = string.Empty;
+                    runtimeOptions = default;
+                    logLevel = SharpEmuLog.MinimumLevel;
+                    return false;
+                }
+
+                continue;
+            }
+
             if (argument.StartsWith("--", StringComparison.Ordinal))
             {
                 ebootPath = string.Empty;
                 runtimeOptions = default;
                 logLevel = SharpEmuLog.MinimumLevel;
+                logFilePath = null;
                 return false;
             }
 
@@ -690,6 +938,7 @@ internal static partial class Program
             ebootPath = string.Empty;
             runtimeOptions = default;
             logLevel = SharpEmuLog.MinimumLevel;
+            logFilePath = null;
             return false;
         }
 
@@ -789,6 +1038,56 @@ internal static partial class Program
         public nuint JobMemoryLimit;
         public nuint PeakProcessMemoryUsed;
         public nuint PeakJobMemoryUsed;
+    }
+
+    private sealed class TeeTextWriter : TextWriter
+    {
+        private readonly TextWriter _primary;
+        private readonly TextWriter _mirror;
+
+        public TeeTextWriter(TextWriter primary, TextWriter mirror)
+        {
+            _primary = primary;
+            _mirror = mirror;
+        }
+
+        public override Encoding Encoding => _primary.Encoding;
+
+        public override void Write(char value)
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.Write(value);
+                _mirror.Write(value);
+            }
+        }
+
+        public override void Write(string? value)
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.Write(value);
+                _mirror.Write(value);
+            }
+        }
+
+        public override void WriteLine(string? value)
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.WriteLine(value);
+                _mirror.WriteLine(value);
+            }
+        }
+
+        public override void Flush()
+        {
+            lock (ConsoleMirrorSync)
+            {
+                _primary.Flush();
+                _mirror.Flush();
+            }
+        }
     }
 
     [DllImport("kernel32.dll", SetLastError = true)]
