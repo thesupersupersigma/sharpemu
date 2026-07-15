@@ -708,8 +708,22 @@ se_gpu_result SE_GPU_CALL se_gpu_create(const se_gpu_create_info* info, se_gpu_b
     SDL_SetMainReady();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD))
         return abandon(b, SE_GPU_PLATFORM_ERROR, SDL_GetError());
+    int window_width = static_cast<int>(std::min(info->width, static_cast<uint32_t>(INT32_MAX)));
+    int window_height = static_cast<int>(std::min(info->height, static_cast<uint32_t>(INT32_MAX)));
+    SDL_Rect usable{};
+    SDL_DisplayID display = SDL_GetPrimaryDisplay();
+    if (display && SDL_GetDisplayUsableBounds(display, &usable) && usable.w > 0 && usable.h > 0) {
+        int maximum_width = std::max(usable.w * 9 / 10, 1);
+        int maximum_height = std::max(usable.h * 9 / 10, 1);
+        if (window_width > maximum_width || window_height > maximum_height) {
+            double scale = std::min(static_cast<double>(maximum_width) / window_width,
+                static_cast<double>(maximum_height) / window_height);
+            window_width = std::max(static_cast<int>(window_width * scale), 1);
+            window_height = std::max(static_cast<int>(window_height * scale), 1);
+        }
+    }
     b->window = SDL_CreateWindow(info->title_utf8 ? info->title_utf8 : "SharpEmu",
-        static_cast<int>(info->width), static_cast<int>(info->height), SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+        window_width, window_height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!b->window) return abandon(b, SE_GPU_PLATFORM_ERROR, SDL_GetError());
     if (!SDL_ShowWindow(b->window)) return abandon(b, SE_GPU_PLATFORM_ERROR, SDL_GetError());
     SDL_RaiseWindow(b->window);
@@ -915,7 +929,7 @@ se_gpu_result SE_GPU_CALL se_gpu_submit_draw(se_gpu_backend* b, const se_gpu_dra
         if (descriptor_layout) vkDestroyDescriptorSetLayout(b->device, descriptor_layout, nullptr);
         for (VkSampler sampler : samplers) if (sampler) vkDestroySampler(b->device, sampler, nullptr);
         for (uint32_t index = 0; index < work->texture_count; ++index)
-            if (texture_views[index] && texture_views[index] != textures[index]->view)
+            if (texture_views[index] && textures[index] && texture_views[index] != textures[index]->view)
                 vkDestroyImageView(b->device, texture_views[index], nullptr);
         destroy_buffer(b, &index_buffer);
         for (auto& buffer : vertex_buffers) destroy_buffer(b, &buffer);
@@ -1203,7 +1217,7 @@ se_gpu_result SE_GPU_CALL se_gpu_submit_compute(se_gpu_backend* b, const se_gpu_
         if (descriptor_layout) vkDestroyDescriptorSetLayout(b->device, descriptor_layout, nullptr);
         for (VkSampler sampler : samplers) if (sampler) vkDestroySampler(b->device, sampler, nullptr);
         for (uint32_t index = 0; index < work->texture_count; ++index)
-            if (texture_views[index] && texture_views[index] != images[index]->view)
+            if (texture_views[index] && images[index] && texture_views[index] != images[index]->view)
                 vkDestroyImageView(b->device, texture_views[index], nullptr);
         for (auto& image : transient_images) destroy_image(b, &image);
         for (auto& buffer : buffers) destroy_buffer(b, &buffer);
