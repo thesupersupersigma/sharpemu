@@ -3,6 +3,7 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
+using System.Globalization;
 using System.Text;
 using Xunit;
 
@@ -51,5 +52,39 @@ public sealed class KernelMemoryCompatExportsTests
         Span<byte> output = stackalloc byte[7];
         Assert.True(memory.TryRead(destinationAddress, output));
         Assert.Equal("0.5576\0", Encoding.UTF8.GetString(output));
+    }
+
+    [Fact]
+    public void Sprintf_UsesCLocaleForFloatingPoint()
+    {
+        var previousCulture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("tr-TR");
+
+            const ulong memoryBase = 0x1_0000_0000;
+            const ulong destinationAddress = memoryBase + 0x100;
+            const ulong formatAddress = memoryBase + 0x200;
+            var memory = new FakeCpuMemory(memoryBase, 0x1000);
+            var context = new CpuContext(memory, Generation.Gen5);
+            memory.WriteCString(formatAddress, "%.4f");
+            context[CpuRegister.Rdi] = destinationAddress;
+            context[CpuRegister.Rsi] = formatAddress;
+            context.SetXmmRegister(
+                0,
+                unchecked((ulong)BitConverter.DoubleToInt64Bits(0.5576)),
+                0);
+
+            var result = KernelMemoryCompatExports.Sprintf(context);
+
+            Assert.Equal(0, result);
+            Span<byte> output = stackalloc byte[7];
+            Assert.True(memory.TryRead(destinationAddress, output));
+            Assert.Equal("0.5576\0", Encoding.UTF8.GetString(output));
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = previousCulture;
+        }
     }
 }
