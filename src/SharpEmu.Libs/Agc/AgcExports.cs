@@ -3805,20 +3805,12 @@ public static partial class AgcExports
                 _tracedProducerlessWaits.Clear();
             }
 
-            if (!stale && producer is null &&
+            if (!stale &&
                 !_tracedProducerlessWaits.Add(
                     (memory, waiter.WaitAddress, waiter.SubmissionId)))
             {
                 return;
             }
-        }
-
-        // Producer-backed waits are trace-only. Keep the producer lookup above
-        // because producerless waits are always warned, but do not build the
-        // detailed condition strings when AGC tracing is disabled.
-        if (producer is not null && !_traceAgc)
-        {
-            return;
         }
 
         var prefix = stale ? "agc.wait_stale" : "agc.wait_suspended";
@@ -3841,16 +3833,29 @@ public static partial class AgcExports
             return;
         }
 
-        TraceAgc(
+        // Producer-backed suspensions must stay visible without AGC tracing:
+        // a queue that parks on a producer-backed wait and never resumes is
+        // otherwise completely silent, which hides head-of-line wedges (the
+        // dedup above keeps this to one line per label/submission).
+        var producerLine =
             $"{prefix} label=0x{waiter.WaitAddress:X16} " +
             $"queue={waiter.QueueName} submission={waiter.SubmissionId} " +
+            $"command=0x{commandAddress:X16} packet=0x{packetAddress:X16} " +
             condition + " " +
             $"producer_seq={producer.Sequence} producer_state=" +
             $"{(producer.Completed ? "completed" : "queued")} " +
             $"producer_queue={producer.QueueName} " +
             $"producer_submission={producer.SubmissionId} " +
             $"producer_packet=0x{producer.PacketAddress:X16} " +
-            $"action='{producer.DebugName}'");
+            $"action='{producer.DebugName}'";
+        if (_traceAgc)
+        {
+            TraceAgc(producerLine);
+        }
+        else
+        {
+            Console.Error.WriteLine($"[LOADER][WARN] {producerLine}");
+        }
     }
 
     private static void ApplySubmittedAcquireMem(
