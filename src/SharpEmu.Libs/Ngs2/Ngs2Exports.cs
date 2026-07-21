@@ -903,4 +903,35 @@ public static class Ngs2Exports
         Target = Generation.Gen4 | Generation.Gen5,
         LibraryName = "libSceNgs2")]
     public static int Ngs2GeomResetListenerParam(CpuContext ctx) => ctx.SetReturn(0);
+
+    // Geometry -> voice-parameter projection: (rdi) listener work, (rsi) source
+    // param block, (rdx) out buffer, (rcx) selector. Dead Cells calls this from
+    // four spatialisation setters (guest 0x801740150/230/2e0/390, the only four
+    // call sites in the image) and we leave the out buffer untouched, so the 3D
+    // pan / attenuation params never get applied and voices keep the gain the
+    // port-matrix param gave them — the same graceful degradation the three
+    // sibling Geom stubs above already accept.
+    //
+    // Returning 0 is safe rather than merely convenient: at all four call sites
+    // the guest ignores the result outright (the instruction at each return
+    // address is `lea r14, [rbp-0x160]`, and rax is overwritten by the next
+    // call before it is ever read; the nearby `cmp rax` / `jne` belongs to the
+    // __stack_chk_guard reload, not to us), so no control flow depends on it.
+    // Leaving the import unresolved was in fact the worse option — that path
+    // returns ORBIS_GEN2_ERROR_NOT_FOUND in rax and logs on every call.
+    //
+    // The stale out buffer is not currently observable: the guest copies 0x134
+    // bytes of it, then hands sceNgs2VoiceRunCommands a 16-byte command record
+    // {u32 size=5, u32 id=0x21100, void* data} whose data pointer is the only
+    // reference to that copy. Our Ngs2VoiceRunCommands aliases Ngs2VoiceControl,
+    // which parses a command array as a SceNgs2VoiceParamHead list and bails on
+    // `size < 8` before dereferencing +8. That is a shape mismatch, not a
+    // design: anyone implementing a real command-array parser must revisit this
+    // stub first, or the uninitialised buffer becomes live input.
+    [SysAbiExport(
+        Nid = "eF8yRCC6W64",
+        ExportName = "sceNgs2GeomApply",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNgs2")]
+    public static int Ngs2GeomApply(CpuContext ctx) => ctx.SetReturn(0);
 }
